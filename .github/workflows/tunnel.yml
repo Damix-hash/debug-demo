@@ -1,0 +1,67 @@
+name: Tunnel
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'      # every 2 hours, UTC
+  workflow_dispatch:
+
+concurrency:
+  group: tunnel-scheduled
+  cancel-in-progress: true
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cloudflared
+        run: |
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+          sudo dpkg -i cloudflared.deb
+          cloudflared --version
+
+      - name: Serve docs + start tunnel
+        run: |
+          set -euo pipefail
+
+          # 1. Static server for the docs/ folder
+          python3 -m http.server 3000 --directory docs > /tmp/http.log 2>&1 &
+          APP_PID=$!
+          echo "HTTP server PID: $APP_PID"
+
+          # 2. Start cloudflared
+          cloudflared tunnel --url http://localhost:3000 --no-autoupdate > /tmp/cf.log 2>&1 &
+          CF_PID=$!
+          echo "Cloudflared PID: $CF_PID"
+
+          # 3. Wait for the trycloudflare URL
+          URL=""
+          for i in {1..60}; do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+
+          if [ -z "$URL" ]; then
+            echo "::error::Tunnel URL never appeared"
+            cat /tmp/cf.log
+            exit 1
+          fi
+
+          echo "TUNNEL_URL=$URL" >> "$GITHUB_ENV"
+          echo "::notice::Live at $URL"
+          echo "Live at $URL"
+
+          # 4. Keep alive until the 2h timeout or cancel
+          while kill -0 "$CF_PID" 2>/dev/null; do
+            sleep 30
+          done
+
+      - name: Dump logs on exit
+        if: always()
+        run: |
+          echo "--- cloudflared ---"; cat /tmp/cf.log 2>/dev/null || true
+          echo "--- http ---";       cat /tmp/http.log 2>/dev/null || true
